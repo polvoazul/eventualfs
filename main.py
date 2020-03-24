@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 import logging
 import os
+import xattr
 
 from collections import defaultdict
 from errno import ENOENT
@@ -17,15 +18,16 @@ class EventualFS(LoggingMixIn, Operations):
     def __init__(self):
         self.memory = '/dev/shm/eventual'
         self.final = '/var/eventual'
-        os.mkdir(self.memory)
-        os.mkdir(self.final)
+        self.fd = 0
+        os.makedirs(self.memory, exist_ok=True)
+        os.makedirs(self.final, exist_ok=True)
         now = time()
 
     def do(self, command, path, *args):
         try:
-            command(self.memory+path, *args)
+            return command(self.memory+path, *args)
         except IOError:
-            command(self.final+path, *args)
+            return command(self.final+path, *args)
 
     def chmod(self, path, mode):
         self.do(os.chmod, path, mode)
@@ -38,10 +40,14 @@ class EventualFS(LoggingMixIn, Operations):
             return f.fileno()
 
     def getattr(self, path, fh=None):
-        Path(path).stat()
+        s = self.do(lambda p: Path(p).stat(), path)
+        return dict( st_mode=s.st_mode, st_nlink=s.st_nlink,
+                st_size=s.st_size, st_ctime=s.st_ctime,
+                st_mtime=s.st_mtime, st_atime=s.st_atime)
             #raise FuseOSError(ENOENT)
 
-    # def getxattr(self, path, name, position=0):
+    def getxattr(self, path, name, position=0):
+        xattr.get(path, name)
     #     attrs = self.files[path].get('attrs', {})
 
     #     try:
@@ -54,17 +60,10 @@ class EventualFS(LoggingMixIn, Operations):
     #     return attrs.keys()
 
     def mkdir(self, path, mode):
-        print('FUUUUUUUUUUUCK')
-        print(path)
-        self.files[path] = dict(
-            st_mode=(S_IFDIR | mode),
-            st_nlink=2,
-            st_size=0,
-            st_ctime=time(),
-            st_mtime=time(),
-            st_atime=time())
+        self.do(os.mkdir, path, mode)
 
-        self.files['/']['st_nlink'] += 1
+    def close(self, path, flags):
+        raise NotImplementedError
 
     def open(self, path, flags):
         self.fd += 1
@@ -74,7 +73,12 @@ class EventualFS(LoggingMixIn, Operations):
         return self.data[path][offset:offset + size]
 
     def readdir(self, path, fh):
-        return ['.', '..'] + [x[1:] for x in self.files if x != '/']
+        files = ['.', '..']
+        try: files += os.listdir(self.memory + path)
+        except FileNotFoundError: pass
+        try: files += os.listdir(self.final + path)
+        except FileNotFoundError: pass
+        return list(set(files))
 
     def readlink(self, path):
         return self.data[path]
@@ -123,12 +127,16 @@ class EventualFS(LoggingMixIn, Operations):
         self.files.pop(path)
 
     def utimens(self, path, times=None):
-        now = time()
-        atime, mtime = times if times else (now, now)
-        self.files[path]['st_atime'] = atime
-        self.files[path]['st_mtime'] = mtime
+        if not times:
+            now = time()
+            times = (now, now)
+        self.do(os.utime, path, times)
 
     def write(self, path, data, offset, fh):
+        with open(self.memory + path, 'wb') as f:
+            f.seek(offset)
+            f.write(data)
+        return len(data)
         self.data[path] = (
             # make sure the data gets inserted at the right offset
             self.data[path][:offset].ljust(offset, '\x00'.encode('ascii'))
@@ -137,7 +145,6 @@ class EventualFS(LoggingMixIn, Operations):
             + self.data[path][offset + len(data):])
         self.files[path]['st_size'] = len(self.data[path])
         return len(data)
-
 
 if __name__ == '__main__':
     import argparse
