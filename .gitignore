@@ -1,0 +1,5 @@
+*egg-info
+.*sw?
+.coverage
+.mypy_cache/
+
